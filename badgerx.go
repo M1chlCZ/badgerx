@@ -218,7 +218,7 @@ func (store *BadgerStore) IncrementCountersOnceAt(
 func validateBadgerCounterEvent(
 	dedupeKeys, counterKeys []string,
 	now, expiresAt time.Time,
-) (int64, error) {
+) (uint64, error) {
 	if err := validateUniqueBadgerKeys(dedupeKeys); err != nil {
 		return 0, err
 	}
@@ -231,17 +231,20 @@ func validateBadgerCounterEvent(
 		}
 	}
 	expiresUnix := expiresAt.Unix()
-	if expiresUnix < 0 || expiresUnix <= now.Unix() {
+	if expiresUnix < 0 {
 		return 0, ErrBadgerTTLInvalid
 	}
-	return expiresUnix, nil
+	if expiresUnix <= now.Unix() {
+		return 0, ErrBadgerTTLInvalid
+	}
+	return uint64(expiresUnix), nil
 }
 
 func incrementBadgerCountersTxn(
 	ctx context.Context,
 	txn *badger.Txn,
 	dedupeKeys, counterKeys []string,
-	expiresUnix int64,
+	expiresUnix uint64,
 ) error {
 	seen, err := badgerDedupeSeen(ctx, txn, dedupeKeys)
 	if err != nil || seen {
@@ -255,7 +258,7 @@ func incrementBadgerCountersTxn(
 		return err
 	}
 	entry := badger.NewEntry([]byte(dedupeKeys[0]), []byte{1})
-	entry.ExpiresAt = uint64(expiresUnix)
+	entry.ExpiresAt = expiresUnix
 	if err = txn.SetEntry(entry); err != nil {
 		return err
 	}

@@ -1,3 +1,4 @@
+//nolint:testpackage // White-box tests exercise the unexported BadgerStore.db field.
 package badgerx
 
 import (
@@ -119,19 +120,9 @@ func TestIncrementBadgerCountersOnceSkipsPreviouslySeenDedupeKey(t *testing.T) {
 			counterKey := "total/product"
 
 			if seenIndex == 0 {
-				if err := store.IncrementCountersOnce(
-					context.Background(),
-					dedupeKeys,
-					time.Now().Add(time.Hour),
-					[]string{counterKey}); err != nil {
-					t.Fatalf("first increment: %v", err)
-				}
-			} else if err := store.StoreValueTTL(
-				context.Background(),
-				dedupeKeys[seenIndex],
-				true,
-				time.Hour); err != nil {
-				t.Fatalf("seed previous marker: %v", err)
+				seedCurrentDedupeMarker(t, store, dedupeKeys, counterKey)
+			} else {
+				seedPreviousDedupeMarker(t, store, dedupeKeys[seenIndex])
 			}
 
 			if err := store.IncrementCountersOnce(
@@ -143,31 +134,62 @@ func TestIncrementBadgerCountersOnceSkipsPreviouslySeenDedupeKey(t *testing.T) {
 			}
 
 			if seenIndex == 0 {
-				got, err := store.GetValue[int64](context.Background(), counterKey)
-				if err != nil {
-					t.Fatalf("get counter: %v", err)
-				}
-				if got != 1 {
-					t.Fatalf("counter = %d, want 1", got)
-				}
+				assertDedupeCounterIncremented(t, store, counterKey)
 				return
 			}
-
-			if _, err := store.GetValue[int64](
-				context.Background(),
-				counterKey); !errors.Is(
-				err,
-				badger.ErrKeyNotFound,
-			) {
-				t.Fatalf("counter error = %v, want badger.ErrKeyNotFound", err)
-			}
-			if err := store.db.View(func(txn *badger.Txn) error {
-				_, err := txn.Get([]byte(dedupeKeys[0]))
-				return err
-			}); !errors.Is(err, badger.ErrKeyNotFound) {
-				t.Fatalf("primary marker error = %v, want badger.ErrKeyNotFound", err)
-			}
+			assertDedupeCounterSkipped(t, store, counterKey, dedupeKeys[0])
 		})
+	}
+}
+
+func seedCurrentDedupeMarker(t *testing.T, store *BadgerStore, dedupeKeys []string, counterKey string) {
+	t.Helper()
+	if err := store.IncrementCountersOnce(
+		context.Background(),
+		dedupeKeys,
+		time.Now().Add(time.Hour),
+		[]string{counterKey}); err != nil {
+		t.Fatalf("first increment: %v", err)
+	}
+}
+
+func seedPreviousDedupeMarker(t *testing.T, store *BadgerStore, key string) {
+	t.Helper()
+	if err := store.StoreValueTTL(
+		context.Background(),
+		key,
+		true,
+		time.Hour); err != nil {
+		t.Fatalf("seed previous marker: %v", err)
+	}
+}
+
+func assertDedupeCounterIncremented(t *testing.T, store *BadgerStore, counterKey string) {
+	t.Helper()
+	got, err := store.GetValue[int64](context.Background(), counterKey)
+	if err != nil {
+		t.Fatalf("get counter: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("counter = %d, want 1", got)
+	}
+}
+
+func assertDedupeCounterSkipped(t *testing.T, store *BadgerStore, counterKey, primaryDedupeKey string) {
+	t.Helper()
+	if _, err := store.GetValue[int64](
+		context.Background(),
+		counterKey); !errors.Is(
+		err,
+		badger.ErrKeyNotFound,
+	) {
+		t.Fatalf("counter error = %v, want badger.ErrKeyNotFound", err)
+	}
+	if err := store.db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get([]byte(primaryDedupeKey))
+		return err
+	}); !errors.Is(err, badger.ErrKeyNotFound) {
+		t.Fatalf("primary marker error = %v, want badger.ErrKeyNotFound", err)
 	}
 }
 
@@ -404,8 +426,7 @@ func TestIncrementBadgerCountersOnceRequiresContext(t *testing.T) {
 	store := openTestBadger(t)
 
 	err := store.IncrementCountersOnce(
-		nil,
-
+		nil, //nolint:staticcheck // The nil context asserts the ErrBadgerContextRequired guard.
 		[]string{"dedupe/view"},
 		time.Now().Add(time.Hour),
 		[]string{"total/product"})
@@ -682,8 +703,7 @@ func TestScanBadgerCountersRejectsInvalidArgumentsAndClosedStore(t *testing.T) {
 		t.Fatalf("empty prefix result = %#v, error = %v; want non-nil map and ErrBadgerKeyRequired", got, err)
 	}
 	if _, err := store.ScanCounters(
-		nil,
-
+		nil, //nolint:staticcheck // The nil context asserts the ErrBadgerContextRequired guard.
 		"day/"); !errors.Is(
 		err,
 		ErrBadgerContextRequired,
@@ -793,8 +813,7 @@ func TestBackupBadgerRequiresContext(t *testing.T) {
 	store := openTestBadger(t)
 
 	if err := store.Backup(
-		nil,
-
+		nil, //nolint:staticcheck // The nil context asserts the ErrBadgerContextRequired guard.
 		&bytes.Buffer{}); !errors.Is(
 		err,
 		ErrBadgerContextRequired,

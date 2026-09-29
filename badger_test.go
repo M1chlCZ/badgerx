@@ -1,3 +1,4 @@
+//nolint:testpackage // White-box tests exercise the unexported BadgerStore.db field.
 package badgerx
 
 import (
@@ -394,8 +395,7 @@ func TestBadgerHelpersRejectInvalidArgumentsAndClosedStore(t *testing.T) {
 		t.Fatalf("negative TTL error = %v, want ErrBadgerTTLInvalid", err)
 	}
 	if err := store.DeleteValue(
-		nil,
-
+		nil, //nolint:staticcheck // The nil context asserts the ErrBadgerContextRequired guard.
 		"key"); !errors.Is(
 		err,
 		ErrBadgerContextRequired,
