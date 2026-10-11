@@ -346,7 +346,7 @@ func parseBadgerCounter(encoded []byte) (int64, error) {
 	return value, nil
 }
 
-// ScanCounters loads nonnegative counters whose full keys share prefix.
+// ScanCounters loads nonnegative counters whose keys start with prefix.
 func (store *BadgerStore) ScanCounters(ctx context.Context, prefix string) (map[string]int64, error) {
 	counters := make(map[string]int64)
 	if err := validateBadgerArgs(ctx, store, prefix); err != nil {
@@ -389,7 +389,7 @@ func (store *BadgerStore) ScanCounters(ctx context.Context, prefix string) (map[
 	return counters, nil
 }
 
-// Backup writes a native full backup without closing writer.
+// Backup writes a native full backup and does not close writer.
 func (store *BadgerStore) Backup(ctx context.Context, writer io.Writer) error {
 	if ctx == nil {
 		return ErrBadgerContextRequired
