@@ -18,17 +18,19 @@ import (
 )
 
 var (
-	ErrBadgerContextRequired  = errors.New("badger context is required")
-	ErrBadgerStoreUnavailable = errors.New("badger store is unavailable")
-	ErrBadgerPathRequired     = errors.New("badger path is required")
-	ErrBadgerKeyRequired      = errors.New("badger key is required")
-	ErrBadgerKeyDuplicate     = errors.New("badger keys must be unique")
-	ErrBadgerTTLInvalid       = errors.New("badger TTL must be positive")
-	ErrBadgerWriterRequired   = errors.New("badger backup writer is required")
-	ErrBadgerValueEncode      = errors.New("badger value encoding failed")
-	ErrBadgerValueDecode      = errors.New("badger value decoding failed")
-	ErrBadgerCounterInvalid   = errors.New("badger counter is not an int64")
-	ErrBadgerCounterOverflow  = errors.New("badger counter overflow")
+	ErrBadgerContextRequired     = errors.New("badger context is required")
+	ErrBadgerStoreUnavailable    = errors.New("badger store is unavailable")
+	ErrBadgerPathRequired        = errors.New("badger path is required")
+	ErrBadgerKeyRequired         = errors.New("badger key is required")
+	ErrBadgerKeyDuplicate        = errors.New("badger keys must be unique")
+	ErrBadgerTTLInvalid          = errors.New("badger TTL must be positive")
+	ErrBadgerWriterRequired      = errors.New("badger backup writer is required")
+	ErrBadgerVisitorRequired     = errors.New("badger visitor is required")
+	ErrBadgerValueEncode         = errors.New("badger value encoding failed")
+	ErrBadgerValueDecode         = errors.New("badger value decoding failed")
+	ErrBadgerCounterInvalid      = errors.New("badger counter is not an int64")
+	ErrBadgerCounterOverflow     = errors.New("badger counter overflow")
+	ErrBadgerDiscardRatioInvalid = errors.New("badger discard ratio must be between 0 and 1")
 )
 
 // BadgerStore owns one Badger database instance.
@@ -389,6 +391,110 @@ func (store *BadgerStore) ScanCounters(ctx context.Context, prefix string) (map[
 	return counters, nil
 }
 
+const (
+	defaultBadgerBatch = 256
+	maxBadgerBatch     = 4096
+)
+
+// IterateOptions configures Iterate.
+type IterateOptions struct {
+	// Prefix limits iteration to keys that start with Prefix.
+	Prefix string
+	// Batch is the maximum number of items passed to one visit call. Values
+	// above 4096 are capped at 4096; zero and negative values use 256.
+	Batch int
+}
+
+// IterateItem is one raw key-value pair delivered by Iterate.
+type IterateItem struct {
+	Key   string
+	Value json.RawMessage
+}
+
+// Iterate visits raw key-value pairs in lexicographic key order, one visit per
+// batch of at most options.Batch items, for keys that start with
+// options.Prefix. A batch defaults to 256 items and never exceeds 4096. Each
+// batch runs in one read-only transaction, so a long scan does not pin one
+// transaction; writes committed between batches may appear in later batches.
+// Iteration resumes after the last delivered key. Visit errors stop iteration
+// and are returned unchanged.
+func (store *BadgerStore) Iterate(
+	ctx context.Context,
+	options IterateOptions,
+	visit func(items []IterateItem) error,
+) error {
+	if ctx == nil {
+		return ErrBadgerContextRequired
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if store == nil || store.db == nil {
+		return ErrBadgerStoreUnavailable
+	}
+	if visit == nil {
+		return ErrBadgerVisitorRequired
+	}
+	if store.db.IsClosed() {
+		return ErrBadgerStoreUnavailable
+	}
+	batch := options.Batch
+	if batch <= 0 {
+		batch = defaultBadgerBatch
+	}
+	if batch > maxBadgerBatch {
+		batch = maxBadgerBatch
+	}
+	prefix := []byte(options.Prefix)
+	seek := prefix
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		items := make([]IterateItem, 0, batch)
+		var lastKey []byte
+		err := store.db.View(func(txn *badger.Txn) error {
+			iteratorOptions := badger.DefaultIteratorOptions
+			iteratorOptions.PrefetchValues = false
+			iterator := txn.NewIterator(iteratorOptions)
+			defer iterator.Close()
+			for iterator.Seek(seek); iterator.ValidForPrefix(prefix); iterator.Next() {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				item := iterator.Item()
+				key := item.KeyCopy(nil)
+				encoded, err := item.ValueCopy(nil)
+				if err != nil {
+					return err
+				}
+				if errCause := ctx.Err(); errCause != nil {
+					return errCause
+				}
+				items = append(items, IterateItem{Key: string(key), Value: encoded})
+				lastKey = key
+				if len(items) == batch {
+					return nil
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		if err := visit(items); err != nil {
+			return err
+		}
+		if len(items) < batch {
+			return nil
+		}
+		seek = append(lastKey, 0)
+	}
+}
+
 // Backup writes a native full backup and does not close writer.
 func (store *BadgerStore) Backup(ctx context.Context, writer io.Writer) error {
 	if ctx == nil {
@@ -447,6 +553,45 @@ func (writer *contextWriter) Write(value []byte) (int, error) {
 		return written, io.ErrShortWrite
 	}
 	return written, nil
+}
+
+// RunValueLogGC runs at most one value log garbage collection pass with the
+// given discard ratio, which must be between 0 and 1. It reports whether a
+// rewrite ran; false with a nil error means Badger found nothing to rewrite.
+// Callers loop until it returns false.
+func (store *BadgerStore) RunValueLogGC(ctx context.Context, discardRatio float64) (bool, error) {
+	if ctx == nil {
+		return false, ErrBadgerContextRequired
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if store == nil || store.db == nil {
+		return false, ErrBadgerStoreUnavailable
+	}
+	if discardRatio <= 0 || discardRatio >= 1 {
+		return false, ErrBadgerDiscardRatioInvalid
+	}
+	store.lifecycle.RLock()
+	defer store.lifecycle.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if store.db.IsClosed() {
+		return false, ErrBadgerStoreUnavailable
+	}
+	rewriteErr := store.db.RunValueLogGC(discardRatio)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	switch {
+	case rewriteErr == nil:
+		return true, nil
+	case errors.Is(rewriteErr, badger.ErrNoRewrite):
+		return false, nil
+	default:
+		return false, rewriteErr
+	}
 }
 
 // DeleteValue deletes one value. Deleting a missing key succeeds.

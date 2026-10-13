@@ -4,8 +4,11 @@ package badgerx
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -418,6 +421,286 @@ func TestBadgerHelpersRejectInvalidArgumentsAndClosedStore(t *testing.T) {
 		badger.ErrDBClosed,
 	) {
 		t.Fatalf("closed store error = %v, want badger.ErrDBClosed", storeBadgerValueErr)
+	}
+}
+
+func TestIterateBadgerDeliversLexicographicBatches(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	keys := []string{"item:1", "item:2", "item:3", "item:4", "item:5"}
+	for _, key := range keys {
+		if err := store.StoreValue(context.Background(), key, strings.ToUpper(key)); err != nil {
+			t.Fatalf("seed %q: %v", key, err)
+		}
+	}
+
+	var visits [][]IterateItem
+	err := store.Iterate(
+		context.Background(),
+		IterateOptions{Batch: 2},
+		func(items []IterateItem) error {
+			visits = append(visits, slices.Clone(items))
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if len(visits) != 3 {
+		t.Fatalf("visits = %d, want 3", len(visits))
+	}
+	for index, wantSize := range []int{2, 2, 1} {
+		if len(visits[index]) != wantSize {
+			t.Fatalf("visit %d size = %d, want %d", index, len(visits[index]), wantSize)
+		}
+	}
+	var gotKeys []string
+	for _, items := range visits {
+		for _, item := range items {
+			gotKeys = append(gotKeys, item.Key)
+			if want := strconv.Quote(strings.ToUpper(item.Key)); string(item.Value) != want {
+				t.Fatalf("value for %q = %s, want %s", item.Key, item.Value, want)
+			}
+		}
+	}
+	if !slices.Equal(gotKeys, keys) {
+		t.Fatalf("keys = %v, want %v", gotKeys, keys)
+	}
+}
+
+func TestIterateBadgerFiltersByPrefix(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	for _, key := range []string{"other:1", "product:2", "product:1", "session:1"} {
+		if err := store.StoreValue(context.Background(), key, 1); err != nil {
+			t.Fatalf("seed %q: %v", key, err)
+		}
+	}
+
+	var got []string
+	err := store.Iterate(
+		context.Background(),
+		IterateOptions{Prefix: "product:"},
+		func(items []IterateItem) error {
+			for _, item := range items {
+				got = append(got, item.Key)
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if want := []string{"product:1", "product:2"}; !slices.Equal(got, want) {
+		t.Fatalf("keys = %v, want %v", got, want)
+	}
+}
+
+func TestIterateBadgerPropagatesVisitorError(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	for _, key := range []string{"item:1", "item:2", "item:3"} {
+		if err := store.StoreValue(context.Background(), key, 1); err != nil {
+			t.Fatalf("seed %q: %v", key, err)
+		}
+	}
+	wantErr := errors.New("visitor stopped")
+	visits := 0
+
+	err := store.Iterate(context.Background(), IterateOptions{Batch: 1}, func([]IterateItem) error {
+		visits++
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("iterate error = %v, want visitor error", err)
+	}
+	if visits != 1 {
+		t.Fatalf("visits = %d, want 1", visits)
+	}
+}
+
+func TestIterateBadgerStopsOnCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	for _, key := range []string{"item:1", "item:2", "item:3", "item:4"} {
+		if err := store.StoreValue(context.Background(), key, 1); err != nil {
+			t.Fatalf("seed %q: %v", key, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	visits := 0
+
+	err := store.Iterate(ctx, IterateOptions{Batch: 2}, func([]IterateItem) error {
+		visits++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("iterate error = %v, want context.Canceled", err)
+	}
+	if visits != 1 {
+		t.Fatalf("visits = %d, want 1", visits)
+	}
+}
+
+func TestIterateBadgerRejectsInvalidArguments(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	if err := store.Iterate(
+		context.Background(),
+		IterateOptions{},
+		nil); !errors.Is(
+		err,
+		ErrBadgerVisitorRequired,
+	) {
+		t.Fatalf("nil visitor error = %v, want ErrBadgerVisitorRequired", err)
+	}
+	if err := store.Iterate(
+		nil, //nolint:staticcheck // The nil context asserts the ErrBadgerContextRequired guard.
+		IterateOptions{},
+		func([]IterateItem) error { return nil }); !errors.Is(
+		err,
+		ErrBadgerContextRequired,
+	) {
+		t.Fatalf("nil context error = %v, want ErrBadgerContextRequired", err)
+	}
+	if err := (*BadgerStore)(nil).Iterate(
+		context.Background(),
+		IterateOptions{},
+		func([]IterateItem) error { return nil }); !errors.Is(
+		err,
+		ErrBadgerStoreUnavailable,
+	) {
+		t.Fatalf("nil store error = %v, want ErrBadgerStoreUnavailable", err)
+	}
+
+	closed, err := OpenBadger(filepath.Join(t.TempDir(), "closed"))
+	if err != nil {
+		t.Fatalf("open store to close: %v", err)
+	}
+	if closeErr := closed.Close(); closeErr != nil {
+		t.Fatalf("close store: %v", closeErr)
+	}
+	if err := closed.Iterate(
+		context.Background(),
+		IterateOptions{},
+		func([]IterateItem) error { return nil }); !errors.Is(
+		err,
+		ErrBadgerStoreUnavailable,
+	) {
+		t.Fatalf("closed store error = %v, want ErrBadgerStoreUnavailable", err)
+	}
+}
+
+func TestIterateBadgerEmptyStoreMakesNoVisits(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	visits := 0
+
+	err := store.Iterate(context.Background(), IterateOptions{Batch: 2}, func([]IterateItem) error {
+		visits++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterate empty store: %v", err)
+	}
+	if visits != 0 {
+		t.Fatalf("visits = %d, want 0", visits)
+	}
+}
+
+func TestIterateBadgerCapsBatchSize(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	keyCount := maxBadgerBatch + 1
+	for index := range keyCount {
+		key := fmt.Sprintf("item:%05d", index)
+		if err := store.StoreValue(context.Background(), key, 1); err != nil {
+			t.Fatalf("seed %q: %v", key, err)
+		}
+	}
+
+	var sizes []int
+	err := store.Iterate(context.Background(), IterateOptions{Batch: keyCount * 2}, func(items []IterateItem) error {
+		sizes = append(sizes, len(items))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if want := []int{maxBadgerBatch, 1}; !slices.Equal(sizes, want) {
+		t.Fatalf("visit sizes = %v, want %v", sizes, want)
+	}
+}
+
+func TestRunBadgerValueLogGCRejectsInvalidArguments(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	for _, ratio := range []float64{-1, 0, 1, 2} {
+		if _, err := store.RunValueLogGC(
+			context.Background(),
+			ratio); !errors.Is(
+			err,
+			ErrBadgerDiscardRatioInvalid,
+		) {
+			t.Fatalf("ratio %v error = %v, want ErrBadgerDiscardRatioInvalid", ratio, err)
+		}
+	}
+	if _, err := store.RunValueLogGC(
+		nil, //nolint:staticcheck // The nil context asserts the ErrBadgerContextRequired guard.
+		0.5); !errors.Is(
+		err,
+		ErrBadgerContextRequired,
+	) {
+		t.Fatalf("nil context error = %v, want ErrBadgerContextRequired", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.RunValueLogGC(canceled, 0.5); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled context error = %v, want context.Canceled", err)
+	}
+	if _, err := (*BadgerStore)(nil).RunValueLogGC(
+		context.Background(),
+		0.5); !errors.Is(
+		err,
+		ErrBadgerStoreUnavailable,
+	) {
+		t.Fatalf("nil store error = %v, want ErrBadgerStoreUnavailable", err)
+	}
+}
+
+func TestRunBadgerValueLogGCRejectsClosedStore(t *testing.T) {
+	t.Parallel()
+
+	store, err := OpenBadger(filepath.Join(t.TempDir(), "closed"))
+	if err != nil {
+		t.Fatalf("open store to close: %v", err)
+	}
+	if closeErr := store.Close(); closeErr != nil {
+		t.Fatalf("close store: %v", closeErr)
+	}
+	if _, err := store.RunValueLogGC(
+		context.Background(),
+		0.5); !errors.Is(
+		err,
+		ErrBadgerStoreUnavailable,
+	) {
+		t.Fatalf("closed store error = %v, want ErrBadgerStoreUnavailable", err)
+	}
+}
+
+func TestRunBadgerValueLogGCReturnsNoRewriteOnFreshStore(t *testing.T) {
+	t.Parallel()
+
+	store := openTestBadger(t)
+	if _, err := store.RunValueLogGC(context.Background(), 0.5); err != nil {
+		t.Fatalf("run value log GC: %v", err)
 	}
 }
 

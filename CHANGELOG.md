@@ -15,3 +15,10 @@ follows Keep a Changelog, and the project uses semantic versioning.
   exports fail with an error instead of panicking.
 - The `badgerverify` command for isolated verification and restore of native
   backups.
+- A bounded batch iterator for raw key-value scans by prefix (`Iterate`,
+  `IterateOptions`, `IterateItem`). Each batch runs in its own read-only
+  transaction, the batch size defaults to 256 and is capped at 4096, and a
+  missing visitor fails with `ErrBadgerVisitorRequired`.
+- A value log garbage collection trigger (`RunValueLogGC`) that runs at most
+  one pass and reports whether a rewrite ran. Invalid discard ratios fail with
+  `ErrBadgerDiscardRatioInvalid`.

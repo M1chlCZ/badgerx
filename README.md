@@ -9,6 +9,8 @@ A typed JSON value store on top of BadgerDB.
 - Increment int64 counters atomically, with overflow checks.
 - Record one deduplicated counter event across several counters.
 - Scan counters by key prefix.
+- Iterate raw key-value batches in lexicographic key order by prefix.
+- Run value log garbage collection passes.
 - Back up the database to a writer while the store stays open.
 - Serve an operator-only online export over a private Unix socket.
 - Restore and verify native backups in isolation.
@@ -36,6 +38,10 @@ profile, err := store.GetValue[Profile](ctx, "user:1")
 err = store.StoreValueTTL(ctx, "session:1", token, time.Hour)
 count, err := store.IncrementValue(ctx, "views:home")
 counters, err := store.ScanCounters(ctx, "views:")
+err = store.Iterate(ctx, badgerx.IterateOptions{Prefix: "product:", Batch: 256}, func(items []badgerx.IterateItem) error {
+	return handleBatch(items)
+})
+rewrote, err := store.RunValueLogGC(ctx, 0.5)
 err = store.IncrementCountersOnce(ctx, []string{"event:abc"}, time.Now().Add(24*time.Hour), []string{"views:home"})
 err = store.Backup(ctx, writer)
 err = store.DeleteValue(ctx, "session:1")
@@ -66,6 +72,12 @@ badgerverify /backups/badger.backup /isolated/restore/store
 ## Notes
 
 - The store owns one Badger database. Open one store for each path.
+- `Iterate` visits at most `Batch` items per call (default 256, maximum
+  4096) and uses one read-only transaction per batch. Writes committed between
+  batches can appear in later batches.
+- `RunValueLogGC` runs one garbage collection pass per call and reports
+  whether a rewrite ran. Loop until it returns `false`, and pass a discard
+  ratio between 0 and 1 (`0.5` matches the Badger recommendation).
 - A deduplicated event counts once. The store persists the first dedupe key as the event marker, and the marker expires at `expiresAt`.
 - A backup keeps the store open. It blocks Close until the backup ends.
 - The export socket is Unix-only and lives inside the Badger directory. It
